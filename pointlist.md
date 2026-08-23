@@ -78,6 +78,33 @@ becomes `Site → Building → Level → Equipment → Point` (no Room in betwee
 under Level without an intervening Room, so data intended for Building OS ingestion must supply a real
 room/zone value in `installation_area` rather than `-` or leaving it blank.
 
+#### `floor` が `-`（ハイフン）・空欄の場合の挙動 / Behavior when `floor` is `-` or blank
+
+`floor` に `-` または `－`（全角ハイフン）を指定した場合、および空欄の場合は、Level（階）が
+**未設定**として扱われます。`installation_area` の場合と違い、Level は階層の途中のリンクなので、
+Level が生成されないとその下の Room・Equipment・Point も生成されません。結果として、
+**その行は RDF / YAML / DTDL / WoT / Tree JSON のいずれにも 1 件も出力されません**（CSV と
+JSON-LD は行をそのまま書き出すため影響を受けません）。
+
+```
+Site → Building → (Level 以下がまるごと欠落)
+```
+
+`site` / `building` が未設定の場合、および Point があって `device_id` と `device_name` の
+いずれも未設定の場合も同じく行ごと出力から外れます。
+
+出力から外れる行が 1 行でもある場合、`row_dropped` として検出され、出力はブロックされます
+（Web はダウンロードを中止し、CLI は exit 1 を返します）。CLI で承知の上で書き出す場合は
+`--allow-issues` を指定してください。
+
+*English*: A value of `-`/`－` (or a blank cell) in `floor` is treated as **unset**. Unlike
+`installation_area`, `Level` is a link in the middle of the chain, so nothing below it is
+generated either — the row contributes **no triples at all** to RDF/YAML/DTDL/WoT/Tree JSON
+output (CSV and JSON-LD write the rows directly and are unaffected). The same applies when
+`site` or `building` is unset, or when a point row has neither `device_id` nor `device_name`.
+Any such row is reported as `row_dropped` and blocks the output; pass `--allow-issues` to the
+CLI to write anyway.
+
 ### ポイント種別 (point_type)
 機器やポイントから取得できるテレメトリのフォーマットを参照するためのプロファイル名、またはテンプレート名。
 具体的な定義については、スキーマファイル等で当該タイプについては別途定義される。

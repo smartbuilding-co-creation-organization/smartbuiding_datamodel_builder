@@ -9,6 +9,7 @@ import { buildOutputRows, mergeOutputRows } from './output-aggregation';
 import { validateRowsWithShacl } from './shacl';
 import { exportCsv } from './csv';
 import { buildTree } from './tree';
+import { checkHierarchyCoverage } from './hierarchy-coverage';
 
 export type OutputPluginResult = {
   content: string;
@@ -182,6 +183,20 @@ const OUTPUT_PLUGINS: OutputPlugin[] = [
   },
 ];
 
+// Plugins that serialize the resource graph rather than the rows. Everything here inherits
+// buildTree()'s row drops -- a row whose Site/Building/Level chain or device link cannot be
+// resolved contributes nothing at all -- so each has to answer for the rows it left out.
+// 'csv' writes the rows verbatim and 'json-ld' maps them one-to-one, so both carry every row.
+const GRAPH_DERIVED_PLUGIN_IDS = new Set([
+  'tree-json',
+  'rdf-turtle',
+  'yaml',
+  'dtdl-interfaces',
+  'dtdl-twin-graph',
+  'wot-td',
+  'wot-tm',
+]);
+
 export function getOutputPlugins(): OutputPlugin[] {
   return [...OUTPUT_PLUGINS];
 }
@@ -202,5 +217,21 @@ export async function runOutputPlugin(
     throw new Error(`Output plugin not found for ${format}/${serializer}`);
   }
   const merged = mergeOutputRows(options.rows, options.modelRows ?? []);
-  return await plugin.run({ ...options, rows: merged });
+  const result = await plugin.run({ ...options, rows: merged });
+
+  if (!GRAPH_DERIVED_PLUGIN_IDS.has(plugin.id)) return result;
+
+  // Reconcile against options.rows -- the actual input -- not `merged`. mergeOutputRows() folds
+  // in the resource model, which contributes synthesized Site/Building/Level/Room rows that were
+  // never input rows of their own and carry none of the hierarchy columns; measuring those would
+  // report every one of them as an unresolvable row.
+  //
+  // Coverage goes FIRST in the list: "these rows were never examined" has to be read before any
+  // conclusion drawn from the SHACL results underneath it.
+  const coverage = checkHierarchyCoverage(options.rows);
+  if (coverage.length === 0) return result;
+  return {
+    ...result,
+    issues: result.issues && result.issues.length > 0 ? [...coverage, ...result.issues] : coverage,
+  };
 }

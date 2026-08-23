@@ -90,6 +90,13 @@ export function HelpModal({ open, view, onClose }: Props) {
               を経由しない階層を受理しないため、ビルOSへ取り込むデータには実際の部屋・ゾーン名を
               指定してください。
             </p>
+            <p>
+              <code>floor</code> が <code>-</code>（ハイフン）または空欄の場合は、Level 以下が
+              まるごと生成されません。その行の Equipment と Point は RDF / YAML / DTDL / WoT / Tree
+              JSON のいずれにも出力されないため、出力はブロックされます。
+              <code>site</code> / <code>building</code> が未設定の場合、および Point があって
+              <code>deviceId</code> / <code>deviceName</code> がいずれも未設定の場合も同じです。
+            </p>
             <h3>任意カラム</h3>
             <p>
               <code>interval</code>, <code>unit</code>, <code>scale</code>, <code>labels</code>,{' '}

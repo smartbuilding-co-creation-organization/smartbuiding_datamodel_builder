@@ -5,9 +5,14 @@ import { parseArgs } from 'node:util';
 import {
   CsvInputLimitError,
   CsvParseError,
+  CsvInputLimits,
+  DEFAULT_CSV_INPUT_LIMITS,
   Issue,
+  RowRecord,
   SchemaRoot,
+  buildOutputRows,
   getOutputPlugins,
+  listUnrepresentedRows,
   parseCsv,
   runOutputPlugin,
   validate,
@@ -21,13 +26,19 @@ const USAGE = `Usage: pnpm cli -- --input <csv> --format <format> [--serializer 
        pnpm cli -- --list-formats
 
 Options:
-  --input <path>       Input CSV file (required unless --list-formats)
-  --format <name>      Output format, e.g. CSV, JSON, JSON-LD, RDF, YAML, DTDL, WoT
-  --serializer <name>  Serializer name, required only when a format has more than one
-  --out <path>         Write output to this file (default: stdout)
-  --allow-issues       Write output even when blocking validation issues are found
-  --list-formats       List available format/serializer combinations and exit
-  --help               Show this message`;
+  --input <path>          Input CSV file (required unless --list-formats)
+  --format <name>         Output format, e.g. CSV, JSON, JSON-LD, RDF, YAML, DTDL, WoT
+  --serializer <name>     Serializer name, required only when a format has more than one
+  --out <path>            Write output to this file (default: stdout)
+  --allow-issues          Write output even when blocking validation issues are found
+  --list-formats          List available format/serializer combinations and exit
+  --help                  Show this message
+
+Input limits (positive integers; the web UI always uses the defaults):
+  --max-rows <n>          Data rows (default: ${DEFAULT_CSV_INPUT_LIMITS.maxRows})
+  --max-bytes <n>         Whole file, in bytes (default: ${DEFAULT_CSV_INPUT_LIMITS.maxBytes})
+  --max-columns <n>       Columns (default: ${DEFAULT_CSV_INPUT_LIMITS.maxColumns})
+  --max-cell-bytes <n>    One cell, in UTF-8 bytes (default: ${DEFAULT_CSV_INPUT_LIMITS.maxCellBytes})`;
 
 function formatIssue(issue: Issue): string {
   const severity = issue.severity ?? 'violation';
@@ -37,6 +48,31 @@ function formatIssue(issue: Issue): string {
 
 function isBlockingIssue(issue: Issue): boolean {
   return issue.severity === undefined || issue.severity === 'violation';
+}
+
+const LIMIT_OPTIONS = {
+  'max-bytes': 'maxBytes',
+  'max-rows': 'maxRows',
+  'max-columns': 'maxColumns',
+  'max-cell-bytes': 'maxCellBytes',
+} as const satisfies Record<string, keyof CsvInputLimits>;
+
+// The defaults exist to keep the browser responsive -- the web app parses, builds the tree,
+// validates and runs SHACL on the main thread with no worker. The CLI has none of those
+// constraints, so it is the way to run a point list that a gateway-by-gateway split would
+// otherwise be needed for. parseCsv() already accepts a partial override; this only exposes it.
+function resolveLimits(values: Record<string, unknown>): Partial<CsvInputLimits> | Error {
+  const limits: Partial<CsvInputLimits> = {};
+  for (const [flag, key] of Object.entries(LIMIT_OPTIONS)) {
+    const raw = values[flag];
+    if (raw === undefined) continue;
+    const parsed = Number(raw);
+    if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+      return new Error(`--${flag} must be a positive integer, got "${String(raw)}"`);
+    }
+    limits[key] = parsed;
+  }
+  return limits;
 }
 
 function loadSchema(): SchemaRoot {
@@ -53,6 +89,23 @@ function listFormats(stdout: Writer): void {
   for (const plugin of plugins) {
     stdout.write(`  --format ${plugin.format} --serializer ${plugin.serializer}\n`);
   }
+}
+
+// How many of the input rows the chosen format actually carries. CSV and JSON-LD serialize the
+// rows directly so every row survives; everything else goes through buildTree()/buildOutputRows()
+// and carries only the rows the resource graph could place. Counted in rows, not resources --
+// the graph also synthesizes Site/Building/Level/Room nodes that were never rows of their own,
+// so a resource count is not comparable with the input row count.
+function describeCoverage(rows: RowRecord[], format: string): string {
+  if (format === 'CSV' || format === 'JSON-LD') {
+    return `Rows read: ${rows.length} -> rows in output: ${rows.length}`;
+  }
+  const dropped = listUnrepresentedRows(rows).length;
+  const resources = buildOutputRows(rows).length;
+  return (
+    `Rows read: ${rows.length} -> rows in output: ${rows.length - dropped}` +
+    ` (dropped: ${dropped}); resources emitted: ${resources}`
+  );
 }
 
 export type CliIO = {
@@ -82,6 +135,10 @@ export async function runCli(
         'allow-issues': { type: 'boolean', default: false },
         'list-formats': { type: 'boolean', default: false },
         help: { type: 'boolean', default: false },
+        'max-bytes': { type: 'string' },
+        'max-rows': { type: 'string' },
+        'max-columns': { type: 'string' },
+        'max-cell-bytes': { type: 'string' },
       },
     }));
   } catch (error) {
@@ -105,6 +162,12 @@ export async function runCli(
   }
   if (!values.format) {
     io.stderr.write(`--format is required\n\n${USAGE}\n`);
+    return 2;
+  }
+
+  const limits = resolveLimits(values);
+  if (limits instanceof Error) {
+    io.stderr.write(`${limits.message}\n\n${USAGE}\n`);
     return 2;
   }
 
@@ -151,7 +214,7 @@ export async function runCli(
 
   let rows;
   try {
-    rows = parseCsv(csvText, { schema });
+    rows = parseCsv(csvText, { schema, limits });
   } catch (error) {
     if (error instanceof CsvParseError || error instanceof CsvInputLimitError) {
       io.stderr.write(`Failed to parse CSV: ${error.message}\n`);
@@ -174,6 +237,11 @@ export async function runCli(
       : undefined;
 
   const result = await runOutputPlugin(plugin.format, plugin.serializer, { rows, schema, shacl });
+
+  // Print the reconciliation unconditionally, before the issues. A run that ends "0 blocking
+  // issues" tells you nothing about how many rows it looked at; this line does, so a silent
+  // drop cannot be mistaken for a clean conversion.
+  io.stderr.write(`${describeCoverage(rows, plugin.format)}\n`);
 
   const blockingIssues = (result.issues ?? []).filter(isBlockingIssue);
   if (blockingIssues.length > 0 && !values['allow-issues']) {

@@ -272,6 +272,44 @@
 - RDF/YAML 出力で SHACL violation がある場合、既定では書き込みがブロックされ、`--allow-issues` で書き込める。
 - `apps/cli/test/cli.test.ts`（vitest）で上記の代表ケースが検証される。
 
+## 2.11 大型ポイントリスト取り込み（入力上限 / 階層欠落の fail-closed）
+
+### 目的
+- 34,895 行・10.6 MB 規模の実ポイントリストを、ゲートウェイ単位に分割せず 1 回で変換・検証できるようにする（CLI）。
+- 階層を解決できず出力に含まれない行を「無言で落とさない」。出力に含まれない行が 1 行でもあれば出力をブロックし、`SHACL violation 0 件` が全点を検査した上での 0 であることを保証する。
+- ビルOS が受理しない `Equipment → Level` 直付け形状（`installation_area` 未設定）を検出できるようにする。
+
+### 現状確認
+- `packages/core/src/tree.ts` の `buildHierarchyTree()` は `site`/`building`/`level` のいずれかが未設定の行、および point があって device が無い行を `continue` で丸ごとスキップする。`buildOutputRows()` は tree に載った resource しか出力しないため、該当行は RDF/YAML/DTDL/WoT/Tree JSON から完全に消える。
+- `floor` が `-`/`－`/空欄なら `normalizeHierarchyValue()` により level は未設定になる。実データでは 3,555 行（10.2%）が該当した。
+- `validate()` の `hierarchy_missing` はダウンロードをブロックしない。Web (`apps/web/src/App.tsx`) も CLI (`apps/cli/src/index.ts`) も、ブロック判定に使うのは `runOutputPlugin` の戻り値 `issues`（SHACL/WoT 由来）だけである。
+- `installation_area` が `-` の行は Room ノードが生成されないだけで、診断コードが一切発行されない。`-` は非空文字なので必須項目チェックも通過する。
+- `parseCsv` は既に `options.limits` で上限を上書きできるが、本番の呼び出し元 2 箇所がいずれも渡していない。
+
+### 設計方針
+- 入力上限の緩和は CLI のみとする。`apps/web` は Worker を使わず tree 構築・`validate()`・SHACL がすべてメインスレッドで走るため、既定値（5 MiB / 20,000 行 / 100 列 / 32 KiB）を据え置く。`DEFAULT_CSV_INPUT_LIMITS` は変更しない。
+- `apps/cli` に `--max-rows` / `--max-bytes` / `--max-columns` / `--max-cell-bytes` を追加し、`parseCsv` に `limits` として渡す。引数解析は `node:util` の `parseArgs` のままとし、新規依存は追加しない。
+- 行スキップ条件は `packages/core/src/row-utils.ts` の `getHierarchyDropReasons()` に集約し、`tree.ts` と新設の coverage チェックが同じ述語を共有する（判定のズレを構造的に防ぐ）。`buildTree()` の挙動自体は変更しない。
+- `packages/core/src/hierarchy-coverage.ts` を新設し、`checkHierarchyCoverage(rows)` が `row_dropped`（violation）と `buildingos_room_missing`（warning）を返す。`row_dropped` は入力行数・欠落行数・理由別内訳の実数を持つサマリ Issue を必ず含み、行単位 Issue の打ち切り件数も明示する。
+- 未設定の Level/Room をプレースホルダとして自動生成することはしない（2.3 の「階層の親が存在しない場合は自動生成せず、バリデーションエラーとして一覧化する」方針を維持する）。
+- `schema/building_model.shacl.ttl` は vendored shapes であり `Equipment locatedIn Level` を正当な形として許すため編集しない。ビルOS 固有の制約はアプリ層のチェックとして実装する。
+- coverage の結果は `runOutputPlugin` の `issues` に合流させ、Web/CLI 双方のブロック判定を UI 側の変更なしに通す。tree を経由しない `CSV` と `JSON-LD` には適用しない。
+
+### 対象パス
+- `packages/core/src/row-utils.ts` / `tree.ts` / `hierarchy-coverage.ts`（新規）/ `output-plugins.ts` / `index.ts`
+- `apps/cli/src/index.ts` / `apps/cli/README.md`
+- `apps/web/src/components/IssuesDrawer.tsx` / `HelpModal.tsx`
+- `README.md` / `pointlist.md`
+- `packages/core/test/core.test.ts` / `apps/cli/test/cli.test.ts` / `apps/web/e2e/app.spec.ts`
+
+### 受入基準
+- `pnpm cli -- --input <csv> --format RDF --serializer Turtle --max-rows 40000 --max-bytes 20971520` で 20,000 行・5 MiB を超える CSV を変換できる。上限オプションに正の整数以外を渡した場合は exit 2 になる。
+- 階層を解決できず出力に含まれない行がある場合、RDF/YAML/DTDL/WoT/Tree JSON の出力は既定でブロックされ（Web はダウンロード中止、CLI は exit 1）、`--allow-issues` でのみ書き込める。CSV/JSON-LD 出力はブロックされない。
+- `row_dropped` サマリ Issue が入力行数・欠落行数・理由別内訳の実数を含み、行単位 Issue を打ち切った場合はその件数も明示する。
+- `installation_area` が `-`/空欄の行に `buildingos_room_missing`（warning）が出力され、出力自体はブロックされない。
+- `floor` が `-`/空欄のときの挙動が `pointlist.md` と UI ヘルプに日英併記で記載される。
+- `packages/core/test/core.test.ts` と `apps/cli/test/cli.test.ts` の unit、`apps/web/e2e/app.spec.ts` の E2E で上記の代表ケースが検証される。
+
 ## 3. マイルストーン（M0〜M3）
 
 ### M0: リポジトリ健全性

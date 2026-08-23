@@ -1,5 +1,10 @@
 import { Node, RowRecord } from './types';
-import { hasHierarchySignals, normalizeValue, resolveHierarchySignals } from './row-utils';
+import {
+  getHierarchyDropReasons,
+  hasHierarchySignals,
+  normalizeValue,
+  resolveHierarchySignals,
+} from './row-utils';
 import { KIND_TO_CLASS } from './constants';
 
 let lastIndex = new Map<string, Node>();
@@ -118,11 +123,10 @@ function buildHierarchyTree(rows: RowRecord[]): Node[] {
 
   for (const row of rows) {
     const signals = resolveHierarchySignals(row);
-    if (!signals.site || !signals.building || !signals.level) {
-      continue;
-    }
-
-    if ((signals.pointId || signals.pointName) && !(signals.deviceId || signals.deviceName)) {
+    // Same predicate the coverage check reports on (row-utils.ts), so "dropped here" and
+    // "reported as dropped" can never disagree. Dropping stays the behaviour; what changed
+    // is that hierarchy-coverage.ts can now enumerate exactly what was dropped and why.
+    if (getHierarchyDropReasons(row).length > 0) {
       continue;
     }
 
@@ -209,9 +213,22 @@ function buildHierarchyTree(rows: RowRecord[]): Node[] {
   return roots;
 }
 
-export function buildTree(rows: RowRecord[]): Node[] {
+export type TreeMode = 'hierarchy-signal' | 'explicit-graph';
+
+// Which of the two tree builders buildTree() will use for this dataset. Exported so callers
+// that need to reason about the resulting graph (hierarchy-coverage.ts) branch on the same
+// rule instead of re-deriving it: a single row carrying parentId puts the WHOLE dataset into
+// explicit id/kind/parentId mode, where the Site/Building/Level/Room columns are not consulted.
+export function resolveTreeMode(rows: RowRecord[]): TreeMode {
   const hasParentIds = rows.some((row) => normalizeValue(row.parentId));
   if (hasParentIds || !hasHierarchySignals(rows)) {
+    return 'explicit-graph';
+  }
+  return 'hierarchy-signal';
+}
+
+export function buildTree(rows: RowRecord[]): Node[] {
+  if (resolveTreeMode(rows) === 'explicit-graph') {
     return buildParentChildTree(rows);
   }
   return buildHierarchyTree(rows);

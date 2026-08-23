@@ -2,6 +2,7 @@
 export * from './constants';
 export * from './csv';
 export * from './device-templates';
+export * from './hierarchy-coverage';
 export * from './output-aggregation';
 export * from './output-plugins';
 export * from './output-utils';

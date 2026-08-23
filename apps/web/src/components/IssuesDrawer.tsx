@@ -1,6 +1,13 @@
 import { Box, Button, Chip, Divider, Drawer, Stack, Typography } from '@mui/material';
 import type { Issue } from '@repo/core';
 
+// One Box per issue is fine for a handful and ruinous for a real point list: a dataset where
+// every row misses installation_area produces an issue per row, and painting tens of thousands
+// of them locks the drawer up. Render a window of them instead. The count chip above still
+// shows the true total, and a line below says exactly how many are not drawn -- nothing is
+// hidden, only unpainted.
+const MAX_RENDERED_ISSUES = 200;
+
 type Props = {
   open: boolean;
   issues: Issue[];
@@ -9,6 +16,9 @@ type Props = {
 };
 
 export function IssuesDrawer({ open, issues, onClose, onJump }: Props) {
+  const rendered = issues.slice(0, MAX_RENDERED_ISSUES);
+  const withheld = issues.length - rendered.length;
+
   return (
     <Drawer anchor="right" open={open} onClose={onClose} data-testid="issues-drawer">
       <Box sx={{ width: { xs: 320, sm: 440 }, p: 2 }} role="dialog" aria-label="検証Issue一覧">
@@ -24,7 +34,7 @@ export function IssuesDrawer({ open, issues, onClose, onJump }: Props) {
           <Typography color="success.main">Issue はありません。</Typography>
         ) : (
           <Stack spacing={1.5}>
-            {issues.map((issue, index) => (
+            {rendered.map((issue, index) => (
               <Box
                 key={`${issue.code}-${issue.focusNode ?? issue.rowId ?? index}-${issue.field ?? ''}`}
                 sx={{ border: 1, borderColor: 'divider', borderRadius: 1, p: 1.5 }}
@@ -63,6 +73,12 @@ export function IssuesDrawer({ open, issues, onClose, onJump }: Props) {
                 ) : null}
               </Box>
             ))}
+            {withheld > 0 ? (
+              <Typography variant="body2" color="text.secondary" data-testid="issues-withheld">
+                全 {issues.length.toLocaleString('ja-JP')} 件のうち{' '}
+                {withheld.toLocaleString('ja-JP')} 件のIssueは表示していません。
+              </Typography>
+            ) : null}
           </Stack>
         )}
       </Box>

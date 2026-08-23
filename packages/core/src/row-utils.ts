@@ -85,6 +85,41 @@ export function resolveHierarchySignals(row: RowRecord): {
   };
 }
 
+export type HierarchyDropReason = 'site' | 'building' | 'level' | 'device';
+
+// The exact condition under which tree.ts's buildHierarchyTree() skips a whole input row --
+// not an approximation of it. buildTree() drops such a row entirely (no Site/Building/Level/
+// Room/Equipment/Point node at all), and buildOutputRows() only emits rows that made it into
+// the graph, so the row silently disappears from RDF/YAML/DTDL/WoT/Tree JSON output. tree.ts
+// and hierarchy-coverage.ts both call this so the "which rows are dropped" answer cannot drift
+// away from the code that actually drops them.
+//
+// Note this is about hierarchy SIGNALS, not raw cell values: normalizeHierarchyValue() already
+// folded "-" / "－" / blank into "unset", so a floor of "-" reaches here as a missing level.
+export function getHierarchyDropReasons(row: RowRecord): HierarchyDropReason[] {
+  const signals = resolveHierarchySignals(row);
+  const reasons: HierarchyDropReason[] = [];
+
+  if (!signals.site) reasons.push('site');
+  if (!signals.building) reasons.push('building');
+  if (!signals.level) reasons.push('level');
+  if (reasons.length > 0) return reasons;
+
+  if ((signals.pointId || signals.pointName) && !(signals.deviceId || signals.deviceName)) {
+    reasons.push('device');
+  }
+  return reasons;
+}
+
+// A row that survives getHierarchyDropReasons() but carries no room signal gets its Equipment
+// attached straight to the Level (tree.ts's `if (signals.room)`). That shape is valid RDF and
+// the vendored SHACL accepts it, but Building OS does not ingest Equipment hanging directly
+// under a Level -- see pointlist.md's installation_area section.
+export function lacksRoomSignal(row: RowRecord): boolean {
+  const signals = resolveHierarchySignals(row);
+  return !signals.room;
+}
+
 export function hasHierarchySignals(rows: RowRecord[]): boolean {
   return rows.some((row) => {
     const signals = resolveHierarchySignals(row);

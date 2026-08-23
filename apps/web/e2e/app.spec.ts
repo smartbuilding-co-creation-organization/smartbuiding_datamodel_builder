@@ -284,6 +284,62 @@ test('rejects over-limit input atomically and keeps the existing model', async (
   await expect(page.getByTestId('grid-csv').locator('[role="row"][data-id]')).toHaveCount(5);
 });
 
+test('blocks RDF download when a row cannot reach the output at all', async ({ page }) => {
+  // floor="-" reads as an unset Level, and Level is a link in the middle of the chain -- the
+  // row's Equipment and Point are never generated, so it contributes nothing to the Turtle.
+  // Before this check the file downloaded anyway and SHACL reported zero violations, having
+  // never seen the missing row.
+  await loadCsv(page);
+  await page.getByTestId('csv-input').setInputFiles({
+    name: 'dropped-row.csv',
+    mimeType: 'text/csv',
+    buffer: Buffer.from(
+      [
+        'gateway_id,device_id,device_name,device_type,site,building,floor,installation_area,point_type,point_specification,point_id,point_name,writable,local_id',
+        'GW1,DEV1,Sensor 1,Sensor,S1,B1,1F,Room101,Temperature,Measurement,PT001,Temp,false,L1',
+        'GW1,DEV3,Sensor 3,Sensor,S1,B1,-,Room103,Temperature,Measurement,PT003,Temp,false,L3',
+      ].join('\n') + '\n',
+    ),
+  });
+  await expect(page.getByTestId('grid-csv').locator('[role="row"][data-id]')).toHaveCount(2);
+
+  await selectFormat(page, 'RDF');
+  await page.getByRole('button', { name: 'ダウンロード', exact: true }).click();
+
+  await expect(page.getByTestId('output-error')).toContainText('ダウンロードを中止');
+  await expect(page.getByTestId('issues-drawer')).toBeVisible();
+  await expect(page.getByTestId('issues-drawer')).toContainText('row_dropped');
+  await expect(page.getByTestId('issues-drawer')).toContainText('出力に含まれるのは 1 行です');
+});
+
+test('warns without blocking when installation_area leaves Equipment under a Level', async ({
+  page,
+}) => {
+  // Valid RDF that the vendored SHACL accepts, but not a shape Building OS ingests -- so it
+  // is surfaced as a warning and the download still goes through.
+  await loadCsv(page);
+  await page.getByTestId('csv-input').setInputFiles({
+    name: 'roomless.csv',
+    mimeType: 'text/csv',
+    buffer: Buffer.from(
+      [
+        'gateway_id,device_id,device_name,device_type,site,building,floor,installation_area,point_type,point_specification,point_id,point_name,writable,local_id',
+        'GW1,DEV1,Sensor 1,Sensor,S1,B1,1F,Room101,Temperature,Measurement,PT001,Temp,false,L1',
+        'GW1,DEV2,Sensor 2,Sensor,S1,B1,1F,-,Temperature,Measurement,PT002,Temp,false,L2',
+      ].join('\n') + '\n',
+    ),
+  });
+
+  await selectFormat(page, 'RDF');
+  const download = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'ダウンロード', exact: true }).click();
+  await expect(await download).toBeTruthy();
+  await expect(page.getByTestId('output-error')).toHaveCount(0);
+
+  await page.getByTestId('validation-summary').click();
+  await expect(page.getByTestId('issues-drawer')).toContainText('buildingos_room_missing');
+});
+
 test('shows generated device templates', async ({ page }) => {
   await loadCsv(page);
   await page.getByTestId('view-templates').click();
