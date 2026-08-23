@@ -34,11 +34,26 @@ CSV は UTF-8、ヘッダーあり、1 行 1 point を前提とします。詳�
 
 上限超過や解析失敗時は既存の画面 state を変更せず、原因と上限を画面に表示します。
 
+この上限は Web UI の既定値です。Web UI は CSV パース、Tree 構築、検証、SHACL をすべて
+メインスレッドで実行するため、上限を緩める手段は用意していません。これを超えるデータは
+`apps/cli` の `--max-rows` / `--max-bytes` / `--max-columns` / `--max-cell-bytes` で
+上限を指定して変換してください。
+
 ## 検証と出力
 
 通常の編集時には schema と参照整合性を検証します。RDF と YAML の出力時には、同じ統合 Resource model から RDF graph を生成し、`schema/building_model.shacl.ttl` を `rdf-validate-shacl` で検証します。Issue には severity、focus node、result path、constraint component、message が含まれます。
 
 `violation` がある場合はダウンロードしません。`warning` と `info` だけの場合は出力できます。serializer が例外を返した場合も、代替内容を作らずエラーを表示して終了します。
+
+RDF、YAML、DTDL、WoT、Tree JSON は Tree から生成するため、階層を解決できない行は出力に含まれません。
+これらの形式では出力前に入力行との件数照合を行い、出力に含まれない行があれば `row_dropped`
+（`violation`）として報告してダウンロードをブロックします。SHACL の検査結果が、出力から
+外れた行を見ないまま「0 件」になることを防ぐためです。CSV と JSON-LD は行をそのまま
+書き出すため対象外です。
+
+`installation_area` が未設定で Equipment が Level 直下になる行は `buildingos_room_missing`
+（`warning`）として報告します。RDF としては妥当なためダウンロードはブロックしませんが、
+ビルOS はこの階層を受理しません。
 
 出力 API は非同期です。
 
@@ -60,6 +75,10 @@ UI を使わずに CSV を任意フォーマットへ変換したい場合は、
 ```bash
 pnpm cli -- --input sample/debug-sample.csv --format RDF --serializer Turtle --out out.ttl
 pnpm cli -- --list-formats
+
+# Web UI の入力上限を超える大規模なポイントリスト
+pnpm cli -- --input large-pointlist.csv --format RDF --serializer Turtle \
+  --max-rows 40000 --max-bytes 20971520 --out out.ttl
 ```
 
 詳細なオプションは [apps/cli/README.md](apps/cli/README.md) を参照してください。
@@ -104,7 +123,7 @@ gitleaks detect --source . --redact --log-opts=--all
 最新版および一つ前の安定版 Chrome / Edge / Firefox / Safari を対象とします。自動 E2E は Chromium で実行します。
 
 - npm package としての公開、サーバー保存、共同編集には対応しません（`apps/cli` はこのモノレポ内でのローカル実行専用で、単体パッケージとしての公開は行いません）。
-- 20,000 行を超えるデータ、Excel ファイル、ドラッグ&ドロップによる階層変更には対応しません。
+- Web UI は 20,000 行を超えるデータに対応しません（`apps/cli` は上限オプションで対応します）。Excel ファイル、ドラッグ&ドロップによる階層変更には対応しません。
 - 未知列の意味検証は行いません。RDF では安全な custom predicate として保持します。
 - 出力先システム固有の制約は、各システムへの import 前にも確認してください。
 

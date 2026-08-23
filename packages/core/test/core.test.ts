@@ -9,6 +9,8 @@ import {
   buildTemplatesZip,
   buildDeviceTemplatesFromCsv,
   buildResourceModelMap,
+  BUILDINGOS_ROOM_MISSING,
+  checkHierarchyCoverage,
   CsvInputLimitError,
   DEFAULT_CSV_INPUT_LIMITS,
   diffDeviceTemplate,
@@ -23,8 +25,13 @@ import {
   getOutputPlugins,
   getLastHeader,
   getSchemaPropertyDescription,
+  getHierarchyDropReasons,
   hasHierarchySignalChange,
   KIND_TO_CLASS,
+  listUnrepresentedRows,
+  MAX_ROW_ISSUES,
+  resolveTreeMode,
+  ROW_DROPPED,
   parseCsv,
   parseDeviceTemplateYaml,
   resetHeaderFromRows,
@@ -1423,5 +1430,196 @@ describe('validateWotThings', () => {
     const result = await runOutputPlugin('WoT', 'Thing Description', { rows });
     expect(Array.isArray(result.issues)).toBe(true);
     expect(result.issues).toEqual([]);
+  });
+});
+
+describe('hierarchy coverage (#B-01)', () => {
+  const HEADER =
+    'gateway_id,device_id,device_name,device_type,site,building,floor,installation_area,point_type,point_specification,point_id,point_name,writable,local_id';
+  const OK =
+    'GW1,DEV1,Sensor 1,Sensor,S1,B1,1F,Room101,Temperature,Measurement,PT001,Temp,false,L1';
+  const NO_ROOM = 'GW1,DEV2,Sensor 2,Sensor,S1,B1,1F,-,Temperature,Measurement,PT002,Temp,false,L2';
+  const NO_FLOOR =
+    'GW1,DEV3,Sensor 3,Sensor,S1,B1,-,Room103,Temperature,Measurement,PT003,Temp,false,L3';
+  const NO_DEVICE = 'GW1,,,Sensor,S1,B1,1F,Room104,Temperature,Measurement,PT004,Temp,false,L4';
+
+  const mixedCsv = [HEADER, OK, NO_ROOM, NO_FLOOR, NO_DEVICE].join('\n') + '\n';
+
+  it('reports the same rows buildTree drops, for the same reasons', () => {
+    // floor="-" is normalized to "unset" by normalizeHierarchyValue, so it reads as a
+    // missing level -- the middle link of the chain, which takes Room/Equipment/Point
+    // with it.
+    expect(getHierarchyDropReasons({ site: 'S', building: 'B', floor: '-' })).toEqual(['level']);
+    expect(getHierarchyDropReasons({ site: 'S', building: 'B', floor: '－' })).toEqual(['level']);
+    expect(getHierarchyDropReasons({ site: 'S', building: 'B', floor: '' })).toEqual(['level']);
+    expect(
+      getHierarchyDropReasons({ site: 'S', building: 'B', floor: '1F', pointId: 'PT1' }),
+    ).toEqual(['device']);
+    expect(
+      getHierarchyDropReasons({
+        site: 'S',
+        building: 'B',
+        floor: '1F',
+        pointId: 'PT1',
+        deviceId: 'D1',
+      }),
+    ).toEqual([]);
+
+    // The predicate has to agree with what buildTree() actually does, not merely look
+    // plausible: every row it calls dropped must be absent from the tree, and every row
+    // it clears must be present.
+    const rows = parseCsv(mixedCsv, { schema });
+    const dropped = new Set(listUnrepresentedRows(rows).map((row) => row.rowId));
+    expect(dropped).toEqual(new Set(['PT003', 'PT004']));
+
+    const inTree = new Set<string>();
+    const visit = (nodes: ReturnType<typeof buildTree>) => {
+      for (const node of nodes) {
+        inTree.add(node.id);
+        visit(node.children);
+      }
+    };
+    visit(buildTree(rows));
+    for (const id of ['PT001', 'PT002']) expect(inTree.has(id)).toBe(true);
+    for (const id of dropped) expect(inTree.has(id as string)).toBe(false);
+  });
+
+  it('summarizes dropped rows with exact totals and a per-reason breakdown', () => {
+    const rows = parseCsv(mixedCsv, { schema });
+    const issues = checkHierarchyCoverage(rows);
+    const summary = issues.find((issue) => issue.code === ROW_DROPPED && !issue.rowId);
+
+    expect(summary?.severity).toBe('violation');
+    expect(summary?.message).toContain('入力 4 行のうち 2 行');
+    expect(summary?.message).toContain('出力に含まれるのは 2 行です');
+    expect(summary?.message).toContain('floor/level 未設定 1件');
+    expect(summary?.message).toContain('device_id/device_name 未設定 1件');
+    // Nothing was withheld at this size, so no truncation notice.
+    expect(summary?.message).not.toContain('省略');
+
+    const perRow = issues.filter((issue) => issue.code === ROW_DROPPED && issue.rowId);
+    expect(perRow.map((issue) => issue.rowId).sort()).toEqual(['PT003', 'PT004']);
+  });
+
+  it('caps per-row issues but keeps the true totals in the summary', () => {
+    const overCap = MAX_ROW_ISSUES + 25;
+    const rows = parseCsv(
+      [
+        HEADER,
+        OK,
+        ...Array.from(
+          { length: overCap },
+          (_, i) =>
+            `GW1,DEV${i},Sensor ${i},Sensor,S1,B1,-,Room1,Temperature,Measurement,PT9${i},Temp,false,L9${i}`,
+        ),
+      ].join('\n') + '\n',
+      { schema },
+    );
+
+    const issues = checkHierarchyCoverage(rows);
+    const summary = issues.find((issue) => issue.code === ROW_DROPPED && !issue.rowId);
+    expect(summary?.message).toContain(`${overCap} 行は`);
+    expect(summary?.message).toContain('残り 25 件は省略');
+    expect(issues.filter((issue) => issue.code === ROW_DROPPED && issue.rowId)).toHaveLength(
+      MAX_ROW_ISSUES,
+    );
+  });
+
+  it('flags the Building-OS-incompatible Level-direct shape as a warning, not a violation', () => {
+    const rows = parseCsv(mixedCsv, { schema });
+    const roomIssues = checkHierarchyCoverage(rows).filter(
+      (issue) => issue.code === BUILDINGOS_ROOM_MISSING,
+    );
+
+    expect(roomIssues.every((issue) => issue.severity === 'warning')).toBe(true);
+    // PT002 keeps its Equipment/Point -- it is emitted, just without a Room in between --
+    // so it must not also be reported as dropped.
+    expect(roomIssues.some((issue) => issue.rowId === 'PT002')).toBe(true);
+    expect(roomIssues.some((issue) => issue.rowId === 'PT003')).toBe(false);
+  });
+
+  it('reports rows with no resolvable id in explicit id/parentId graph mode', () => {
+    const rows = parseCsv(
+      ['id,name,kind,parent_id', 'site-1,Site,site,', ',Orphan,room,site-1'].join('\n') + '\n',
+    );
+    expect(resolveTreeMode(rows)).toBe('explicit-graph');
+    expect(listUnrepresentedRows(rows).map((row) => row.reasons)).toEqual([['id']]);
+  });
+
+  it('reports nothing for the shipped fixtures, which resolve every row', () => {
+    for (const csv of [loadCsv('valid.csv'), loadCsv('large.csv'), loadSampleCsv()]) {
+      expect(checkHierarchyCoverage(parseCsv(csv, { schema }))).toEqual([]);
+    }
+  });
+});
+
+describe('output plugins fail closed on dropped rows (#B-01)', () => {
+  const csv =
+    [
+      'gateway_id,device_id,device_name,device_type,site,building,floor,installation_area,point_type,point_specification,point_id,point_name,writable,local_id',
+      'GW1,DEV1,Sensor 1,Sensor,S1,B1,1F,Room101,Temperature,Measurement,PT001,Temp,false,L1',
+      'GW1,DEV3,Sensor 3,Sensor,S1,B1,-,Room103,Temperature,Measurement,PT003,Temp,false,L3',
+    ].join('\n') + '\n';
+
+  const shapeText = readFileSync(
+    path.resolve(__dirname, '../../../schema/building_model.shacl.ttl'),
+    'utf-8',
+  );
+
+  it.each([
+    ['JSON', 'Tree'],
+    ['RDF', 'Turtle'],
+    ['YAML', 'YAML'],
+    ['DTDL', 'Interfaces'],
+    ['DTDL', 'Twin Graph'],
+    ['WoT', 'Thing Description'],
+    ['WoT', 'Thing Model'],
+  ])('blocks %s/%s output because the graph cannot carry every row', async (format, serializer) => {
+    const rows = parseCsv(csv, { schema });
+    const result = await runOutputPlugin(format, serializer, {
+      rows,
+      schema,
+      shacl: format === 'RDF' || format === 'YAML' ? { shapeText } : undefined,
+    });
+
+    const dropped = (result.issues ?? []).filter((issue) => issue.code === ROW_DROPPED);
+    expect(dropped.length).toBeGreaterThan(0);
+    expect(dropped.every((issue) => issue.severity === 'violation')).toBe(true);
+    // Coverage comes first: "this row was never examined" has to be read before any
+    // conclusion drawn from the SHACL results underneath it.
+    expect(result.issues?.[0]?.code).toBe(ROW_DROPPED);
+  });
+
+  it.each([
+    ['CSV', 'CSV'],
+    ['JSON-LD', 'JSON-LD'],
+  ])('does not block %s output, which serializes the rows directly', async (format, serializer) => {
+    const rows = parseCsv(csv, { schema });
+    const result = await runOutputPlugin(format, serializer, { rows, schema });
+    expect(result.issues ?? []).toEqual([]);
+    expect(result.content).toContain('PT003');
+  });
+
+  it('measures the input rows, not the merged resource model (web output path)', async () => {
+    // apps/web calls runOutputPlugin with modelRows, and mergeOutputRows() folds the resource
+    // model into the row set -- adding synthesized Site/Building/Level/Room rows that were
+    // never input rows and carry none of the hierarchy columns. Reconciling against that merged
+    // set reported every synthesized row as unresolvable, so the count was wrong in both
+    // directions at once: inflated here, and silent about it in the CLI, which passes no
+    // modelRows at all.
+    const rows = parseCsv(csv, { schema });
+    const modelRows = Array.from(buildResourceModelMap(rows).values());
+    const result = await runOutputPlugin('RDF', 'Turtle', { rows, modelRows, schema });
+
+    const dropped = result.issues?.filter((issue) => issue.code === ROW_DROPPED) ?? [];
+    expect(dropped.filter((issue) => issue.rowId).map((issue) => issue.rowId)).toEqual(['PT003']);
+    expect(dropped.find((issue) => !issue.rowId)?.message).toContain('入力 2 行のうち 1 行');
+  });
+
+  it('emits exactly as many PointExt nodes as the reconciliation promises', async () => {
+    const rows = parseCsv(csv, { schema });
+    const result = await runOutputPlugin('RDF', 'Turtle', { rows, schema });
+    const represented = rows.length - listUnrepresentedRows(rows).length;
+    expect(result.content.match(/sbco:PointExt/g) ?? []).toHaveLength(represented);
   });
 });
